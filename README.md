@@ -62,7 +62,9 @@ For external index changes, call `regit-gutter-refresh` or
 | `regit-gutter-revert-hunk` | Confirm and discard the complete saved hunk |
 
 `regit-gutter-delay` defaults to 0.15 seconds. `regit-gutter-prefetch-lines`
-defaults to 8. Signs and faces are customizable; signs should occupy one column.
+defaults to 8. `regit-gutter-max-reads` defaults to 4 and bounds concurrent
+background diffs; extra buffers wait in a queue. Signs and faces are
+customizable; signs should occupy one column.
 `regit-gutter-git-executable` selects Git. The buffer-local
 `regit-gutter--error` retains the most recent diff error for diagnostics.
 
@@ -95,8 +97,9 @@ Git still needs to compute the diff. Parsing scales with patch size and hunk
 count; mapping hunk positions scans the required part of the file. These occur
 on completion and are **not constant-time**. Output and hunk data remain in
 memory. The overlay bound is not a bound on total patch memory or callback time.
-There is currently no global worker pool: enabling many file buffers at once
-can launch one read process per buffer.
+Background diffs are globally bounded by `regit-gutter-max-reads`; buffers that
+would exceed the limit queue until a read finishes. Git writes invoked by
+stage/discard commands bypass the queue.
 
 ## Safety and deliberate scope
 
@@ -138,7 +141,7 @@ make benchmark                     # JSON, simulated 40-line viewport
 python3 scripts/benchmark-load.py --git-gutter-dir /path/to/git-gutter
 ```
 
-The 32 ERT tests cover actual Git staging/discard, stale snapshots, edits during
+The 34 ERT tests cover actual Git staging/discard, stale snapshots, edits during
 async operations, cancellation of discard, initial insertions and empty-file
 deletions, missing final newlines, literal/newline/Unicode filenames, linked
 worktrees, intent-to-add, line-offset staging, independent file-mode changes,

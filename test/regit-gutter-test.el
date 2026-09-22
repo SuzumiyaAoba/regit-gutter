@@ -320,6 +320,87 @@
                                                                      (buffer-name b)))
                            (buffer-list)))))
 
+(ert-deftest regit-hunk-navigation-count ()
+  (with-temp-buffer
+    (dotimes (i 100) (insert (format "line-%d\n" i)))
+    (setq regit-gutter--hunks
+          (vconcat
+           (mapcar (lambda (line)
+                     (let ((hunk (regit-gutter--make-hunk
+                                  :old-start line :old-count 1
+                                  :new-start line :new-count 1)))
+                       (save-excursion
+                         (goto-char (point-min))
+                         (forward-line (1- line))
+                         (setf (regit-gutter--hunk-start hunk) (point)
+                               (regit-gutter--hunk-end hunk)
+                               (save-excursion (forward-line 1) (point))))
+                       hunk))
+                   '(10 50 90))))
+    (goto-char (point-min))
+    (regit-gutter-next-hunk)
+    (should (= 10 (line-number-at-pos)))
+    (regit-gutter-next-hunk 2)
+    (should (= 90 (line-number-at-pos)))
+    (regit-gutter-next-hunk)
+    (should (= 10 (line-number-at-pos)))
+    (regit-gutter-previous-hunk 2)
+    (should (= 50 (line-number-at-pos)))))
+
+(ert-deftest regit-read-pool-serializes-starts ()
+  (regit-test--repo "file.txt"
+    (let ((regit-gutter-max-reads 1)
+          (file2 (expand-file-name "two.txt" root))
+          spawned buffer2)
+      (unwind-protect
+          (progn
+            (with-temp-file file2 (insert (regit-test--text '(7))))
+            (setq buffer2 (find-file-noselect file2))
+            (cl-letf (((symbol-function 'regit-gutter--spawn)
+                       (lambda (&rest _)
+                         (let ((process
+                                (make-process
+                                 :name "regit-stub" :command '("sleep" "60")
+                                 :noquery t
+                                 :sentinel
+                                 (lambda (proc _)
+                                   (when (memq (process-status proc)
+                                               '(exit signal))
+                                     (let ((release (process-get
+                                                     proc 'regit-release)))
+                                       (when release (funcall release))))))))
+                           (push process spawned)
+                           process))))
+              (regit-gutter--start)
+              (should (= 1 regit-gutter--reads))
+              (should (= 1 (length spawned)))
+              ;; The second buffer queues instead of spawning.
+              (with-current-buffer buffer2
+                (setq regit-gutter-mode t
+                      regit-gutter--root root
+                      regit-gutter--path "two.txt")
+                (regit-gutter--start)
+                (should-not regit-gutter--process)
+                (should (memq buffer2 regit-gutter--read-queue)))
+              ;; Freeing the slot drains the queue.
+              (delete-process (car spawned))
+              (let ((deadline (+ (float-time) 5)))
+                (while (and (= 1 (length spawned)) (< (float-time) deadline))
+                  (accept-process-output nil 0.01)))
+              (should (= 2 (length spawned)))
+              (should-not (memq buffer2 regit-gutter--read-queue))
+              (with-current-buffer buffer2
+                (should (processp regit-gutter--process)))))
+        (regit-gutter--stop)
+        (when (buffer-live-p buffer2)
+          (with-current-buffer buffer2 (regit-gutter--stop))
+          (kill-buffer buffer2))
+        (dolist (process spawned)
+          (when (process-live-p process) (delete-process process)))
+        (let ((deadline (+ (float-time) 5)))
+          (while (and (> regit-gutter--reads 0) (< (float-time) deadline))
+            (accept-process-output nil 0.01)))))))
+
 (ert-deftest regit-worktree-git-file ()
   (regit-test--repo "file.txt"
     (let ((worktree (make-temp-file "regit-worktree-" t)) wb)

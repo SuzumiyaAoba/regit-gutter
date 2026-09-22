@@ -25,6 +25,12 @@
   "Seconds to debounce refresh requests." :type 'number)
 (defcustom regit-gutter-prefetch-lines 8
   "Additional lines to render below each window." :type 'natnum)
+(defcustom regit-gutter-max-reads 4
+  "Maximum number of concurrent background Git diff processes.
+Buffers beyond the limit wait in a queue until a slot frees.  Git
+writes started by `regit-gutter-stage-hunk' and
+`regit-gutter-revert-hunk' are not queued."
+  :type 'natnum)
 (defcustom regit-gutter-added-sign "+"
   "One-column addition indicator." :type 'string)
 (defcustom regit-gutter-modified-sign "~"
@@ -36,10 +42,12 @@
 (defface regit-gutter-deleted '((t (:inherit error))) "Deletion face.")
 
 (cl-defstruct (regit-gutter--hunk (:constructor regit-gutter--make-hunk))
-  old-start old-count new-start new-count patch start end)
+  old-start old-count new-start new-count patch-beg patch-end source start end)
 
 (defvar regit-gutter-mode)
 (defvar regit-gutter--buffers nil)
+(defvar regit-gutter--reads 0)
+(defvar regit-gutter--read-queue nil)
 (defvar-local regit-gutter--root nil)
 (defvar-local regit-gutter--path nil)
 (defvar-local regit-gutter--generation 0)
@@ -53,29 +61,41 @@
 (defvar-local regit-gutter--signature nil)
 (defvar-local regit-gutter--error nil)
 
+(defun regit-gutter--hunk-patch (hunk)
+  "Return the raw patch of HUNK, materialized from its source diff."
+  (let ((source (regit-gutter--hunk-source hunk))
+        (beg (regit-gutter--hunk-patch-beg hunk)))
+    (when (and source beg)
+      (substring source beg (regit-gutter--hunk-patch-end hunk)))))
+
 (defun regit-gutter--parse (diff)
   "Return (HEADER . HUNKS) for a single-file unified DIFF.
-HUNKS is a vector.  Preserve the raw patch, including no-newline markers."
+HUNKS is a vector.  Hunks keep offsets into DIFF so the raw patch,
+including no-newline markers, is materialized only on demand."
   (let ((regexp "^@@ -\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? +\\+\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? @@.*$")
         (offset 0) header hunks previous)
     (while (string-match regexp diff offset)
       (let* ((start (match-beginning 0))
              (next (match-end 0))
+             (old-count (match-string-no-properties 2 diff))
+             (new-count (match-string-no-properties 4 diff))
              (hunk (regit-gutter--make-hunk
-                    :old-start (string-to-number (match-string 1 diff))
-                    :old-count (if (match-string 2 diff)
-                                   (string-to-number (match-string 2 diff)) 1)
-                    :new-start (string-to-number (match-string 3 diff))
-                    :new-count (if (match-string 4 diff)
-                                   (string-to-number (match-string 4 diff)) 1))))
+                    :old-start (string-to-number
+                                (match-string-no-properties 1 diff))
+                    :old-count (if old-count (string-to-number old-count) 1)
+                    :new-start (string-to-number
+                                (match-string-no-properties 3 diff))
+                    :new-count (if new-count (string-to-number new-count) 1)
+                    :source diff)))
         (if previous
-            (setf (regit-gutter--hunk-patch (car hunks))
-                  (substring diff previous start))
+            (setf (regit-gutter--hunk-patch-beg (car hunks)) previous
+                  (regit-gutter--hunk-patch-end (car hunks)) start)
           (setq header (substring diff 0 start)))
         (push hunk hunks)
         (setq previous start offset next)))
     (when previous
-      (setf (regit-gutter--hunk-patch (car hunks)) (substring diff previous)))
+      (setf (regit-gutter--hunk-patch-beg (car hunks)) previous
+            (regit-gutter--hunk-patch-end (car hunks)) (length diff)))
     (cons header (vconcat (nreverse hunks)))))
 
 (defun regit-gutter--diff-args ()
@@ -111,11 +131,17 @@ Send INPUT to stdin if non-nil.  Always release process buffers."
                                      (with-current-buffer err (buffer-string)))))
                        (when (buffer-live-p out) (kill-buffer out))
                        (when (buffer-live-p err) (kill-buffer err))
+                       ;; A pooled read frees its slot even when cancelled.
+                       (let ((release (process-get proc 'regit-release)))
+                         (when release (funcall release)))
                        (unless (process-get proc 'regit-cancelled)
                          (funcall callback (process-exit-status proc)
                                   output errors)))))))
-          (when input (process-send-string process input))
-          (process-send-eof process)
+          ;; Git may legitimately exit before consuming stdin; its sentinel
+          ;; still reports the outcome, so a finished process is not an error.
+          (ignore-errors
+            (when input (process-send-string process input))
+            (process-send-eof process))
           process)
       (error
        (when (process-live-p process)
@@ -128,7 +154,9 @@ Send INPUT to stdin if non-nil.  Always release process buffers."
 (defun regit-gutter--cancel-read ()
   "Cancel queued and in-flight read work, never a Git write."
   (when (timerp regit-gutter--timer) (cancel-timer regit-gutter--timer))
-  (setq regit-gutter--timer nil)
+  (setq regit-gutter--timer nil
+        regit-gutter--read-queue
+        (delq (current-buffer) regit-gutter--read-queue))
   (when (process-live-p regit-gutter--process)
     (process-put regit-gutter--process 'regit-cancelled t)
     (delete-process regit-gutter--process))
@@ -161,42 +189,66 @@ Send INPUT to stdin if non-nil.  Always release process buffers."
           (let ((target (max 1 (regit-gutter--hunk-new-start hunk))))
             (forward-line (- target line))
             (setq line target)
+            ;; An integer plus `goto-char' avoids a marker per hunk.
             (setf (regit-gutter--hunk-start hunk) (point)
                   (regit-gutter--hunk-end hunk)
-                  (save-excursion
+                  (let ((here (point)))
                     (forward-line (max 1 (regit-gutter--hunk-new-count hunk)))
-                    (max (point) (1+ (regit-gutter--hunk-start hunk)))))))))))
+                    (prog1 (max (point) (1+ here))
+                      (goto-char here))))))))))
+
+(defun regit-gutter--release-read ()
+  "Free a read slot and start queued buffers while slots remain."
+  (setq regit-gutter--reads (max 0 (1- regit-gutter--reads)))
+  (while (and regit-gutter--read-queue
+              (< regit-gutter--reads (max 1 regit-gutter-max-reads)))
+    (let ((buffer (car regit-gutter--read-queue)))
+      (setq regit-gutter--read-queue (cdr regit-gutter--read-queue))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (regit-gutter--start))))))
 
 (defun regit-gutter--start ()
-  "Launch one file-scoped diff if the buffer represents a saved file."
+  "Launch one file-scoped diff if the buffer represents a saved file.
+At most `regit-gutter-max-reads' diff processes run at once; further
+buffers wait in `regit-gutter--read-queue' until a slot frees."
   (setq regit-gutter--timer nil)
   (when (and regit-gutter-mode (not regit-gutter--operation)
              (not (buffer-modified-p)) buffer-file-name
              (verify-visited-file-modtime (current-buffer)))
     (regit-gutter--cancel-read)
-    (let ((buffer (current-buffer)) (generation regit-gutter--generation)
-          (tick (buffer-chars-modified-tick)) (file buffer-file-name))
-      (condition-case err
-          (setq regit-gutter--process
-                (regit-gutter--spawn
-                 regit-gutter--root (regit-gutter--diff-args)
-                 (lambda (status output errors)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (when (= generation regit-gutter--generation)
-                         (setq regit-gutter--process nil))
-                       (when (regit-gutter--valid-p generation tick file)
-                         (setq regit-gutter--error (unless (zerop status) errors))
-                         (if (not (zerop status))
-                             (regit-gutter--clear)
-                           (let ((parsed (regit-gutter--parse output)))
-                             (setq regit-gutter--diff output
-                                   regit-gutter--header (car parsed)
-                                   regit-gutter--hunks (cdr parsed)
-                                   regit-gutter--signature nil)
-                             (regit-gutter--positions)
-                             (regit-gutter--render)))))))))
-        (error (setq regit-gutter--error (error-message-string err)))))))
+    (if (>= regit-gutter--reads (max 1 regit-gutter-max-reads))
+        (unless (memq (current-buffer) regit-gutter--read-queue)
+          (setq regit-gutter--read-queue
+                (append regit-gutter--read-queue (list (current-buffer)))))
+      (let ((buffer (current-buffer)) (generation regit-gutter--generation)
+            (tick (buffer-chars-modified-tick)) (file buffer-file-name))
+        (condition-case err
+            (let ((process
+                   (regit-gutter--spawn
+                    regit-gutter--root (regit-gutter--diff-args)
+                    (lambda (status output errors)
+                      (when (buffer-live-p buffer)
+                        (with-current-buffer buffer
+                          (when (= generation regit-gutter--generation)
+                            (setq regit-gutter--process nil))
+                          (when (regit-gutter--valid-p generation tick file)
+                            (setq regit-gutter--error
+                                  (unless (zerop status) errors))
+                            (if (not (zerop status))
+                                (regit-gutter--clear)
+                              (let ((parsed (regit-gutter--parse output)))
+                                (setq regit-gutter--diff output
+                                      regit-gutter--header (car parsed)
+                                      regit-gutter--hunks (cdr parsed)
+                                      regit-gutter--signature nil)
+                                (regit-gutter--positions)
+                                (regit-gutter--render))))))))))
+              (setq regit-gutter--process process)
+              (when (processp process)
+                (cl-incf regit-gutter--reads)
+                (process-put process 'regit-release
+                             #'regit-gutter--release-read)))
+          (error (setq regit-gutter--error (error-message-string err))))))))
 
 ;;;###autoload
 (defun regit-gutter-refresh ()
@@ -240,15 +292,33 @@ Use after external index changes, such as a Magit stage or Git checkout."
           (setq hi mid))))
     lo))
 
-(defun regit-gutter--sign (hunk)
-  "Return a propertized margin string for HUNK."
-  (let* ((type (cond ((zerop (regit-gutter--hunk-new-count hunk)) 'deleted)
-                     ((zerop (regit-gutter--hunk-old-count hunk)) 'added)
-                     (t 'modified)))
-         (face (intern (format "regit-gutter-%s" type)))
-         (sign (symbol-value (intern (format "regit-gutter-%s-sign" type)))))
-    (propertize " " 'display
-                `((margin left-margin) ,(propertize sign 'face face)))))
+(defun regit-gutter--lower-bound (position)
+  "Index of the first hunk whose start is at or after POSITION."
+  (let ((lo 0) (hi (length regit-gutter--hunks)))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi) 2)))
+        (if (< (regit-gutter--hunk-start (aref regit-gutter--hunks mid)) position)
+            (setq lo (1+ mid))
+          (setq hi mid))))
+    lo))
+
+(defun regit-gutter--upper-bound (position)
+  "Index of the first hunk whose start is after POSITION."
+  (let ((lo 0) (hi (length regit-gutter--hunks)))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi) 2)))
+        (if (<= (regit-gutter--hunk-start (aref regit-gutter--hunks mid)) position)
+            (setq lo (1+ mid))
+          (setq hi mid))))
+    lo))
+
+(defun regit-gutter--sign (type)
+  "Return a propertized margin string for sign TYPE."
+  (propertize
+   " " 'display
+   `((margin left-margin)
+     ,(propertize (symbol-value (intern (format "regit-gutter-%s-sign" type)))
+                  'face (intern (format "regit-gutter-%s" type))))))
 
 (defun regit-gutter--render (&rest _)
   "Render the visible ranges only, reusing overlays at unchanged positions."
@@ -268,7 +338,8 @@ Use after external index changes, such as a Magit stage or Git checkout."
             (get-buffer-window-list (current-buffer) nil t))))
       (unless (equal ranges regit-gutter--signature)
         (setq regit-gutter--signature ranges)
-        (let ((wanted (make-hash-table :test #'eql)))
+        (let ((wanted (make-hash-table :test #'eql))
+              (signs nil))
           (save-excursion
             (dolist (range ranges)
               (let ((i (regit-gutter--first-hunk (car range))))
@@ -276,8 +347,16 @@ Use after external index changes, such as a Magit stage or Git checkout."
                             (< (regit-gutter--hunk-start
                                 (aref regit-gutter--hunks i)) (cdr range)))
                   (let* ((hunk (aref regit-gutter--hunks i))
-                         (end (min (cdr range) (regit-gutter--hunk-end hunk)))
-                         (sign (regit-gutter--sign hunk)))
+                         (type (cond ((zerop (regit-gutter--hunk-new-count hunk))
+                                      'deleted)
+                                    ((zerop (regit-gutter--hunk-old-count hunk))
+                                     'added)
+                                    (t 'modified)))
+                         (sign (or (cdr (assq type signs))
+                                   (let ((string (regit-gutter--sign type)))
+                                     (push (cons type string) signs)
+                                     string)))
+                         (end (min (cdr range) (regit-gutter--hunk-end hunk))))
                     (goto-char (max (car range) (regit-gutter--hunk-start hunk)))
                     (beginning-of-line)
                     (while (< (point) end)
@@ -343,16 +422,21 @@ Do not overwrite a margin width subsequently changed by another package."
   (interactive "p")
   (unless (> (length regit-gutter--hunks) 0) (user-error "No changes"))
   (let* ((count (or count 1))
-         (positions (cl-loop for hunk across regit-gutter--hunks
-                             for pos = (regit-gutter--hunk-start hunk)
-                             when (<= (point-min) pos (point-max)) collect pos))
+         ;; Hunk starts are ordered and disjoint, so the accessible
+         ;; restriction is a contiguous slice found by binary search.
+         (lo (regit-gutter--lower-bound (point-min)))
+         (hi (regit-gutter--upper-bound (point-max)))
+         (total (- hi lo))
          (position (line-beginning-position))
          (index (if (< count 0)
-                    (1- (cl-loop for p in positions count (< p position)))
-                  (cl-loop for p in positions count (<= p position)))))
-    (unless positions (user-error "No changes in the accessible region"))
-    (goto-char (nth (mod (+ index (if (< count 0) (1+ count) (1- count)))
-                        (length positions)) positions))))
+                    (1- (- (regit-gutter--lower-bound position) lo))
+                  (- (regit-gutter--upper-bound position) lo))))
+    (when (zerop total) (user-error "No changes in the accessible region"))
+    (goto-char
+     (regit-gutter--hunk-start
+      (aref regit-gutter--hunks
+            (+ lo (mod (+ index (if (< count 0) (1+ count) (1- count)))
+                       total)))))))
 
 (defun regit-gutter-previous-hunk (&optional count)
   "Move COUNT hunks backward."
