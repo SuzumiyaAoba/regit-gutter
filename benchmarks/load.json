@@ -1,0 +1,86 @@
+{
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "emacs_executable": "/run/current-system/sw/bin/emacs",
+  "native_jit": false,
+  "warmups_per_package": 1,
+  "runs": {
+    "regit-gutter": [
+      {
+        "seconds": 0.001693,
+        "gcs": 0,
+        "compiler_loaded": false,
+        "library": "/Users/suzumiyaaoba/ghq/github.com/SuzumiyaAoba/regit-gutter/regit-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.001399,
+        "gcs": 0,
+        "compiler_loaded": false,
+        "library": "/Users/suzumiyaaoba/ghq/github.com/SuzumiyaAoba/regit-gutter/regit-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.001323,
+        "gcs": 0,
+        "compiler_loaded": false,
+        "library": "/Users/suzumiyaaoba/ghq/github.com/SuzumiyaAoba/regit-gutter/regit-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.001289,
+        "gcs": 0,
+        "compiler_loaded": false,
+        "library": "/Users/suzumiyaaoba/ghq/github.com/SuzumiyaAoba/regit-gutter/regit-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.001735,
+        "gcs": 0,
+        "compiler_loaded": false,
+        "library": "/Users/suzumiyaaoba/ghq/github.com/SuzumiyaAoba/regit-gutter/regit-gutter.elc",
+        "emacs": "31.1"
+      }
+    ],
+    "git-gutter": [
+      {
+        "seconds": 0.705803,
+        "gcs": 1,
+        "compiler_loaded": true,
+        "library": "/nix/store/rblqp4lniii3ynp294z4dlk9f56h9w4p-emacs-packages-deps/share/emacs/site-lisp/elpa/git-gutter-20241212.1415/git-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.22989,
+        "gcs": 1,
+        "compiler_loaded": true,
+        "library": "/nix/store/rblqp4lniii3ynp294z4dlk9f56h9w4p-emacs-packages-deps/share/emacs/site-lisp/elpa/git-gutter-20241212.1415/git-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.196904,
+        "gcs": 1,
+        "compiler_loaded": true,
+        "library": "/nix/store/rblqp4lniii3ynp294z4dlk9f56h9w4p-emacs-packages-deps/share/emacs/site-lisp/elpa/git-gutter-20241212.1415/git-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.237313,
+        "gcs": 1,
+        "compiler_loaded": true,
+        "library": "/nix/store/rblqp4lniii3ynp294z4dlk9f56h9w4p-emacs-packages-deps/share/emacs/site-lisp/elpa/git-gutter-20241212.1415/git-gutter.elc",
+        "emacs": "31.1"
+      },
+      {
+        "seconds": 0.316745,
+        "gcs": 1,
+        "compiler_loaded": true,
+        "library": "/nix/store/rblqp4lniii3ynp294z4dlk9f56h9w4p-emacs-packages-deps/share/emacs/site-lisp/elpa/git-gutter-20241212.1415/git-gutter.elc",
+        "emacs": "31.1"
+      }
+    ]
+  },
+  "median_seconds": {
+    "regit-gutter": 0.001399,
+    "git-gutter": 0.237313
+  }
+}
